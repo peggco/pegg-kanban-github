@@ -407,3 +407,132 @@ func TestWorktreePrepareHook(t *testing.T) {
 		t.Fatalf("branch = %q", prepared.Context.Branch)
 	}
 }
+
+func TestCardSucceededRoutedFromOtherProvider(t *testing.T) {
+	var commented, pulled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/widgets/issues/42/comments":
+			commented = true
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"id":1}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/widgets/pulls":
+			pulled = true
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"number":7,"html_url":"https://github.com/acme/widgets/pull/7","state":"open"}`)
+		default:
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	g := testPlugin(t, server.URL)
+	settings := g.currentSettings()
+	settings.Owner = "acme"
+	settings.Repo = "widgets"
+	g.setSettings(settings)
+
+	value := map[string]any{
+		"card": map[string]any{
+			"id":    "card-1",
+			"title": "Fix login",
+			"issue": map[string]any{"provider": "jira", "repo": "ABC", "key": "ABC-42"},
+		},
+		"context":                 map[string]any{"kind": "worktree", "branch": "pegg/fix", "base": "main"},
+		"summary":                 "Run finished successfully",
+		"feedback":                true,
+		"create_change_request":   true,
+		"change_request_provider": "github",
+	}
+	raw, _ := json.Marshal(value)
+	result, err := g.ExecuteHook(peggplugin.HookRequest{Name: hookCardSucceeded, Kind: peggplugin.HookAction, Value: raw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.Handled {
+		t.Fatalf("result = %#v", result)
+	}
+	if commented {
+		t.Error("github commented on a non-github issue")
+	}
+	if !pulled {
+		t.Fatal("pull request was not created")
+	}
+}
+
+func TestCardSucceededNotRouted(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		fmt.Fprint(w, `{}`)
+	}))
+	defer server.Close()
+
+	g := testPlugin(t, server.URL)
+	raw := json.RawMessage(`{"card":{"issue":{"provider":"jira","repo":"ABC","key":"ABC-1"}},"create_change_request":true,"change_request_provider":"bitbucket","context":{"branch":"pegg/fix"}}`)
+	result, err := g.ExecuteHook(peggplugin.HookRequest{Name: hookCardSucceeded, Kind: peggplugin.HookAction, Value: raw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Handled {
+		t.Fatalf("result = %#v", result)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("not-routed card made %d requests", requests.Load())
+	}
+}
+
+func TestWorktreePrepareRouting(t *testing.T) {
+	repo := initGitRepo(t)
+	g := &GitHub{settings: Settings{Enabled: true, WorktreeRoot: ".pegg-worktrees", DefaultBase: "main"}}
+
+	payload, _ := json.Marshal(RunPrepare{
+		Card:                  Card{ID: "card-abc", Title: "Fix login"},
+		Repo:                  repo,
+		BaseBranch:            "main",
+		ChangeRequestProvider: "bitbucket",
+		Context:               RunContext{Kind: "repo", Path: repo},
+	})
+	result, err := g.ExecuteHook(peggplugin.HookRequest{Name: hookRunPrepare, Value: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Handled {
+		t.Fatal("run.prepare should not be handled for another change request provider")
+	}
+
+	payload, _ = json.Marshal(RunPrepare{
+		Card:                  Card{ID: "card-abc", Title: "Fix login"},
+		Repo:                  repo,
+		BaseBranch:            "main",
+		ChangeRequestProvider: "github",
+		Context:               RunContext{Kind: "repo", Path: repo},
+	})
+	result, err = g.ExecuteHook(peggplugin.HookRequest{Name: hookRunPrepare, Value: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Handled {
+		t.Fatal("run.prepare should be handled for github")
+	}
+}
+
+func TestWorktreePrepareSkipsNonGitRepo(t *testing.T) {
+	dir := t.TempDir()
+	g := &GitHub{settings: Settings{Enabled: true, WorktreeRoot: ".pegg-worktrees", DefaultBase: "main"}}
+	payload, _ := json.Marshal(RunPrepare{
+		Card:                  Card{ID: "card-abc", Title: "Fix login"},
+		Repo:                  dir,
+		BaseBranch:            "main",
+		ChangeRequestProvider: "github",
+		Context:               RunContext{Kind: "repo", Path: dir},
+	})
+	result, err := g.ExecuteHook(peggplugin.HookRequest{Name: hookRunPrepare, Value: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Handled {
+		t.Fatal("run.prepare should be skipped for a non-git repository")
+	}
+}

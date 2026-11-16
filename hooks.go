@@ -28,6 +28,7 @@ type ProviderInfo struct {
 	Detail        string `json:"detail,omitempty"`
 	Target        string `json:"target,omitempty"`
 	SyncMinutes   int    `json:"sync_minutes,omitempty"`
+	RepoTarget    bool   `json:"repo_target,omitempty"`
 }
 
 type HookIssue struct {
@@ -86,20 +87,22 @@ type RunContext struct {
 }
 
 type RunPrepare struct {
-	Card       Card       `json:"card"`
-	Repo       string     `json:"repo"`
-	BaseBranch string     `json:"base_branch,omitempty"`
-	Context    RunContext `json:"context"`
+	Card                  Card       `json:"card"`
+	Repo                  string     `json:"repo"`
+	BaseBranch            string     `json:"base_branch,omitempty"`
+	ChangeRequestProvider string     `json:"change_request_provider,omitempty"`
+	Context               RunContext `json:"context"`
 }
 
 type CardSucceeded struct {
-	Card                Card        `json:"card"`
-	Context             *RunContext `json:"context,omitempty"`
-	Summary             string      `json:"summary,omitempty"`
-	Feedback            bool        `json:"feedback"`
-	CreateChangeRequest bool        `json:"create_change_request"`
-	TransitionOnSuccess string      `json:"transition_on_success,omitempty"`
-	BaseBranch          string      `json:"base_branch,omitempty"`
+	Card                  Card        `json:"card"`
+	Context               *RunContext `json:"context,omitempty"`
+	Summary               string      `json:"summary,omitempty"`
+	Feedback              bool        `json:"feedback"`
+	CreateChangeRequest   bool        `json:"create_change_request"`
+	ChangeRequestProvider string      `json:"change_request_provider,omitempty"`
+	TransitionOnSuccess   string      `json:"transition_on_success,omitempty"`
+	BaseBranch            string      `json:"base_branch,omitempty"`
 }
 
 type cardSucceededResult struct {
@@ -193,9 +196,6 @@ func (g *GitHub) executeHook(ctx context.Context, settings Settings, req peggplu
 		if err := decodeHookValue(req.Value, &payload); err != nil {
 			return nil, false, err
 		}
-		if payload.Card.Issue == nil || strings.TrimSpace(payload.Card.Issue.Provider) != "github" {
-			return nil, false, nil
-		}
 		return g.cardSucceededHook(ctx, settings, payload)
 	default:
 		return nil, false, nil
@@ -230,6 +230,7 @@ func (g *GitHub) providersHook(ctx context.Context, settings Settings, raw json.
 		Authenticated: status.Authenticated,
 		Detail:        providerDetail(settings, status, target),
 		Target:        target,
+		RepoTarget:    true,
 	}
 	out := make([]ProviderInfo, 0, len(providers)+1)
 	for _, provider := range providers {
@@ -274,14 +275,14 @@ func providerDetail(settings Settings, status AuthStatus, target string) string 
 	case !status.Authenticated:
 		return "Authenticate with `gh auth login` or set plugins.options.kanban-github.token"
 	case target == "":
-		return "Set plugins.options.kanban-github.repo to owner/name"
+		return "No GitHub repository found; open the board inside a GitHub repository or set plugins.options.kanban-github.repo"
 	default:
 		return "Ready to sync from " + target
 	}
 }
 
 func (g *GitHub) runPrepareHook(settings Settings, payload RunPrepare) (json.RawMessage, bool, error) {
-	if !settings.Enabled || strings.TrimSpace(payload.Repo) == "" {
+	if !settings.Enabled || strings.TrimSpace(payload.Repo) == "" || !handlesChangeRequest(payload.ChangeRequestProvider) || !isGitRepo(payload.Repo) {
 		return nil, false, nil
 	}
 	base := strings.TrimSpace(payload.BaseBranch)
@@ -406,25 +407,41 @@ func hookIssue(issue Issue) HookIssue {
 }
 
 func (g *GitHub) cardSucceededHook(ctx context.Context, settings Settings, payload CardSucceeded) (json.RawMessage, bool, error) {
-	issue := payload.Card.Issue
-	owner, repo, _, err := resolveRepo(settings, issue.Repo)
+	issueProvider := ""
+	if payload.Card.Issue != nil {
+		issueProvider = strings.TrimSpace(payload.Card.Issue.Provider)
+	}
+	isIssueProvider := strings.EqualFold(issueProvider, "github")
+	isChangeRequestTarget := changeRequestTarget(payload.ChangeRequestProvider, isIssueProvider)
+	if !isIssueProvider && !isChangeRequestTarget {
+		return nil, false, nil
+	}
+
+	repoArg := ""
+	if isIssueProvider && payload.Card.Issue != nil {
+		repoArg = payload.Card.Issue.Repo
+	}
+	owner, repo, _, err := resolveRepo(settings, repoArg)
 	if err != nil {
 		return nil, false, err
 	}
 	client := g.apiClient(settings)
-	result := cardSucceededResult{IssueNumber: issue.Number}
+	result := cardSucceededResult{}
+	if payload.Card.Issue != nil {
+		result.IssueNumber = payload.Card.Issue.Number
+	}
 
-	if payload.Feedback && strings.TrimSpace(payload.Summary) != "" {
-		if issue.Number <= 0 {
+	if isIssueProvider && payload.Feedback && strings.TrimSpace(payload.Summary) != "" {
+		if payload.Card.Issue == nil || payload.Card.Issue.Number <= 0 {
 			return nil, false, fmt.Errorf("github issue number is required for feedback")
 		}
-		if _, err := client.CreateIssueComment(ctx, owner, repo, issue.Number, payload.Summary); err != nil {
+		if _, err := client.CreateIssueComment(ctx, owner, repo, payload.Card.Issue.Number, payload.Summary); err != nil {
 			return nil, false, err
 		}
 		result.Commented = true
 	}
 
-	if payload.CreateChangeRequest && payload.Context != nil {
+	if isChangeRequestTarget && payload.CreateChangeRequest && payload.Context != nil {
 		branch := strings.TrimSpace(payload.Context.Branch)
 		if branch != "" {
 			title := strings.TrimSpace(payload.Card.Title)
@@ -477,4 +494,29 @@ func cardChangeRequestBody(body, summary string) string {
 		return summary
 	}
 	return body + "\n\n" + summary
+}
+
+func handlesChangeRequest(provider string) bool {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return true
+	}
+	return strings.EqualFold(provider, "github")
+}
+
+func isGitRepo(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	_, err := gitOutput(path, "rev-parse", "--show-toplevel")
+	return err == nil
+}
+
+func changeRequestTarget(provider string, isIssueProvider bool) bool {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return isIssueProvider
+	}
+	return strings.EqualFold(provider, "github")
 }
